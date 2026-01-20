@@ -1,0 +1,148 @@
+version: "3.8"
+
+x-common: &common
+  platform: linux/amd64
+
+services:
+  # --- HADOOP SERVICES ---
+  namenode:
+    <<: *common
+    image: bde2020/hadoop-namenode:2.0.0-hadoop2.7.4-java8
+    volumes:
+      - namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=test
+    env_file:
+      - ./hadoop-hive.env
+    ports:
+      - "50070:50070"
+  
+  datanode:
+    <<: *common
+    image: bde2020/hadoop-datanode:2.0.0-hadoop2.7.4-java8
+    volumes:
+      - datanode:/hadoop/dfs/data
+    env_file:
+      - ./hadoop-hive.env
+    environment:
+      SERVICE_PRECONDITION: "namenode:50070"
+    ports:
+      - "50075:50075"
+
+  # --- HIVE METASTORE & SERVER SERVICES ---
+  hive-metastore-postgresql:
+    <<: *common
+    image: bde2020/hive-metastore-postgresql:3.1.0
+    platform: linux/amd64
+    environment:
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    volumes:
+      - ./conf/create_tables.sql:/docker-entrypoint-initdb.d/create_tables.sql
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "hue" ]
+      interval: 5s
+      retries: 5
+
+  hive-metastore:
+    <<: *common
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    env_file:
+      - ./hadoop-hive.env
+    command: /opt/hive/bin/hive --service metastore
+    environment:
+      SERVICE_PRECONDITION: "namenode:50070 datanode:50075 hive-metastore-postgresql:5432"
+    ports:
+      - "9083:9083"
+    depends_on:
+      hive-metastore-postgresql:
+        condition: service_healthy
+
+  hive-server:
+    <<: *common
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    env_file:
+      - ./hadoop-hive.env
+    environment:
+      HIVE_CORE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://hive-metastore/metastore"
+      SERVICE_PRECONDITION: "hive-metastore:9083"
+      HIVE_CONF_hive_txn_timeout: 1800
+      HIVE_CONF_hive_lock_query_timeout_ms: 300000
+      HIVE_CONF_hive_compactor_cleaner_on: true
+      HIVE_CONF_hive_compactor_worker_threads: 5
+    ports:
+      - "10000:10000"
+
+  # --- APACHE SPARK SERVICES ---
+  spark-master:
+    <<: *common
+    image: bde2020/spark-master:2.4.0-hadoop2.7
+    container_name: spark-master
+    environment:
+      - INIT_DAEMON_STEP=setup_spark
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+    ports:
+      # Spark Master Web UI
+      - "8080:8080"
+      # Spark Master communication port
+      - "7077:7077"
+    depends_on:
+      - namenode
+      - datanode
+    volumes:
+      # 1. Скрипты и приложение: Монтируем в /app
+      - ./data_processor.py:/app/data_processor.py
+      - ./spark-submit.sh:/app/spark-submit.sh
+      - ./geohash_job.py:/app/geohash_job.py
+      # 2. Локальное хранилище данных: Монтируем папку с данными в /data
+      - ./data/restaurant_csv/:/data/restaurant_csv/ # Уточненный путь в контейнере
+      - ./data/:/data/
+
+  spark-worker-1:
+    <<: *common
+    image: bde2020/spark-worker:2.4.0-hadoop2.7
+    container_name: spark-worker-1
+    environment:
+      # Link to the Spark Master
+      - SPARK_MASTER=spark://spark-master:7077
+      - INIT_DAEMON_STEP=setup_spark
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # Ограничиваем ресурсы для примера
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+    ports:
+      # Spark Worker Web UI
+      - "8081:8081"
+    depends_on:
+      - spark-master
+      - namenode
+      - datanode
+      
+    volumes:
+      # Рабочие узлы также должны видеть данные и скрипты
+      - ./data/restaurant_csv/:/data/restaurant_csv/ # Уточненный путь в контейнере
+      - ./data_processor.py:/app/data_processor.py
+      - ./spark-submit.sh:/app/spark-submit.sh
+      - ./data/:/data/      
+
+  # --- HUE SERVICE ---
+  hue:
+    <<: *common
+    image: gethue/hue:20241231-140101
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./conf/hue.ini:/usr/share/hue/desktop/conf/hue.ini
+    depends_on:
+      hive-metastore-postgresql:
+        condition: service_healthy
+
+volumes:
+  namenode:
+  datanode:
+  postgres:
